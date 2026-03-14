@@ -175,26 +175,21 @@ class TestTryActivateFallback:
             assert agent._fallback_activated is False
 
     def test_custom_base_url(self):
-        """Custom base_url in config should override the provider default."""
+        """Custom base_url in config should build a real client from inline config."""
         agent = _make_agent(
             fallback_model={
                 "provider": "custom",
                 "model": "my-model",
                 "base_url": "http://localhost:8080/v1",
-                "api_key_env": "MY_CUSTOM_KEY",
+                "api_key": "test-key",
             },
         )
-        mock_client = _mock_resolve(
-            api_key="custom-secret",
-            base_url="http://localhost:8080/v1",
-        )
-        with patch(
-            "agent.auxiliary_client.resolve_provider_client",
-            return_value=(mock_client, "my-model"),
-        ):
-            assert agent._try_activate_fallback() is True
-            assert agent.client is mock_client
-            assert agent.model == "my-model"
+        # Inline base_url entries bypass resolve_provider_client entirely
+        # and build a client directly from the config dict.
+        assert agent._try_activate_fallback() is True
+        assert agent.model == "my-model"
+        assert agent.client is not None
+        assert "localhost:8080" in str(agent.client.base_url)
 
     def test_prompt_caching_enabled_for_claude_on_openrouter(self):
         agent = _make_agent(
@@ -358,6 +353,7 @@ class TestProviderCredentials:
         ("kimi-coding", "KIMI_API_KEY", "moonshot.ai"),
         ("minimax", "MINIMAX_API_KEY", "minimax.io"),
         ("minimax-cn", "MINIMAX_CN_API_KEY", "minimaxi.com"),
+        ("groq", "GROQ_API_KEY", "groq.com"),
     ])
     def test_provider_resolves(self, provider, env_var, base_url_fragment):
         agent = _make_agent(
@@ -375,3 +371,147 @@ class TestProviderCredentials:
             assert agent.client is mock_client
             assert agent.model == "test-model"
             assert agent.provider == provider
+
+
+# =============================================================================
+# Fallback chain (list of providers)
+# =============================================================================
+
+class TestFallbackChain:
+    """Verify cascade-down and recover-up behavior with a chain of providers."""
+
+    def test_chain_init_from_list(self):
+        chain = [
+            {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+            {"provider": "kimi-coding", "model": "kimi-k2.5"},
+            {"provider": "custom", "model": "qwen3.5:latest",
+             "base_url": "http://localhost:11434/v1", "api_key": "ollama"},
+        ]
+        agent = _make_agent(fallback_model=chain)
+        assert agent._fallback_chain == chain
+        assert agent._fallback_chain_index == 0
+        assert agent._fallback_model == chain[0]  # legacy compat
+
+    def test_chain_init_from_single_dict(self):
+        fb = {"provider": "groq", "model": "llama-3.3-70b-versatile"}
+        agent = _make_agent(fallback_model=fb)
+        assert agent._fallback_chain == [fb]
+        assert agent._fallback_model == fb
+
+    def test_chain_init_empty_list(self):
+        agent = _make_agent(fallback_model=[])
+        assert agent._fallback_chain == []
+        assert agent._fallback_model is None
+
+    def test_chain_cascades_through_multiple_providers(self):
+        chain = [
+            {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+            {"provider": "kimi-coding", "model": "kimi-k2.5"},
+        ]
+        agent = _make_agent(fallback_model=chain)
+
+        # First fallback: groq fails, kimi succeeds
+        mock_groq = MagicMock()
+        mock_groq.base_url = "https://api.groq.com/openai/v1"
+        mock_groq.api_key = "gsk-test"
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(None, None),  # groq unavailable
+        ):
+            assert agent._try_activate_fallback() is False  # groq fails
+
+        # Reset — now test that kimi was also tried and index advanced
+        assert agent._fallback_chain_index == 2  # past both entries
+
+    def test_chain_cascades_down_then_succeeds(self):
+        chain = [
+            {"provider": "groq", "model": "llama-3.3-70b-versatile"},
+            {"provider": "kimi-coding", "model": "kimi-k2.5"},
+        ]
+        agent = _make_agent(fallback_model=chain)
+
+        mock_kimi = MagicMock()
+        mock_kimi.base_url = "https://api.moonshot.ai/v1"
+        mock_kimi.api_key = "sk-test"
+
+        call_count = [0]
+        def side_effect(provider, model=None, raw_codex=False):
+            call_count[0] += 1
+            if call_count[0] == 1:  # groq fails
+                return (None, None)
+            return (mock_kimi, "kimi-k2.5")  # kimi succeeds
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=side_effect,
+        ):
+            result = agent._try_activate_fallback()
+            assert result is True
+            assert agent.model == "kimi-k2.5"
+            assert agent.provider == "kimi-coding"
+
+    def test_inline_custom_endpoint_bypasses_resolver(self):
+        chain = [
+            {"provider": "custom", "model": "qwen3.5:latest",
+             "base_url": "http://localhost:11434/v1", "api_key": "ollama"},
+        ]
+        agent = _make_agent(fallback_model=chain)
+
+        # Should NOT call resolve_provider_client at all
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=AssertionError("should not be called"),
+        ):
+            result = agent._try_activate_fallback()
+            assert result is True
+            assert agent.model == "qwen3.5:latest"
+            assert "localhost:11434" in str(agent.client.base_url)
+
+    def test_primary_snapshot_saved_on_first_fallback(self):
+        chain = [{"provider": "groq", "model": "llama-3.3-70b-versatile"}]
+        agent = _make_agent(fallback_model=chain)
+        original_model = agent.model
+        original_provider = agent.provider
+
+        mock_client = MagicMock()
+        mock_client.base_url = "https://api.groq.com/openai/v1"
+        mock_client.api_key = "gsk-test"
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "llama-3.3-70b-versatile"),
+        ):
+            agent._try_activate_fallback()
+
+        assert hasattr(agent, "_primary_snapshot")
+        assert agent._primary_snapshot["model"] == original_model
+        assert agent._primary_snapshot["provider"] == original_provider
+
+    def test_recovery_counter_increments(self):
+        chain = [{"provider": "groq", "model": "llama-3.3-70b-versatile"}]
+        agent = _make_agent(fallback_model=chain)
+        agent._fallback_activated = True
+        agent._recovery_call_count = 0
+
+        # Call _maybe_try_recovery a few times — should increment counter
+        agent._fallback_chain_index = 1
+        agent._primary_snapshot = None  # no snapshot, recovery can't work
+
+        for i in range(4):
+            agent._maybe_try_recovery()
+            assert agent._recovery_call_count == i + 1
+
+    def test_chain_exhausted_returns_false(self):
+        chain = [{"provider": "groq", "model": "llama-3.3-70b-versatile"}]
+        agent = _make_agent(fallback_model=chain)
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(None, None),
+        ):
+            result = agent._try_activate_fallback()
+            assert result is False
+            # Second call should also return False (chain exhausted)
+            result2 = agent._try_activate_fallback()
+            assert result2 is False

@@ -569,16 +569,31 @@ class AIAgent:
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
         
-        # Provider fallback — a single backup model/provider tried when the
-        # primary is exhausted (rate-limit, overload, connection failure).
-        # Config shape: {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
-        self._fallback_model = fallback_model if isinstance(fallback_model, dict) else None
+        # Provider fallback chain — ordered list of backup model/providers
+        # tried sequentially when the primary (or previous fallback) fails.
+        # Config shape: single dict (legacy) or list of dicts.
+        #   {"provider": "kimi-coding", "model": "kimi-k2.5"}
+        #   [{"provider": "kimi-coding", "model": "kimi-k2.5"},
+        #    {"provider": "custom", "model": "qwen3.5:latest",
+        #     "base_url": "http://localhost:11434/v1", "api_key": "ollama"}]
+        if isinstance(fallback_model, dict):
+            self._fallback_chain = [fallback_model]
+        elif isinstance(fallback_model, list):
+            self._fallback_chain = [fb for fb in fallback_model if isinstance(fb, dict)]
+        else:
+            self._fallback_chain = []
+        self._fallback_chain_index = 0
+        # Legacy compat: expose first entry as _fallback_model, bool as _fallback_activated
+        self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
         self._fallback_activated = False
-        if self._fallback_model:
-            fb_p = self._fallback_model.get("provider", "")
-            fb_m = self._fallback_model.get("model", "")
-            if fb_p and fb_m and not self.quiet_mode:
-                print(f"🔄 Fallback model: {fb_m} ({fb_p})")
+        if self._fallback_chain and not self.quiet_mode:
+            chain_desc = " → ".join(
+                f"{fb.get('model', '?')} ({fb.get('provider', '?')})"
+                for fb in self._fallback_chain
+                if fb.get("provider") and fb.get("model")
+            )
+            if chain_desc:
+                print(f"🔄 Fallback chain: {chain_desc}")
 
         # Get available tools with filtering
         self.tools = get_tool_definitions(
@@ -2621,41 +2636,167 @@ class AIAgent:
             raise result["error"]
         return result["response"]
 
-    # ── Provider fallback ──────────────────────────────────────────────────
+    # ── Provider fallback chain ──────────────────────────────────────────────
+    # Cascades down through configured providers on failure.
+    # Periodically attempts to recover back UP the chain (primary preferred).
+    #
+    # Chain index -1 = primary provider (the one configured at init).
+    # Index 0..N-1 = entries from _fallback_chain list.
+
+    # How many successful API calls before we try recovering one level up.
+    _RECOVERY_INTERVAL = 5
 
     def _try_activate_fallback(self) -> bool:
-        """Switch to the configured fallback model/provider.
+        """Cascade one step down the fallback chain.
 
-        Called when the primary model is failing after retries.  Swaps the
-        OpenAI client, model slug, and provider in-place so the retry loop
-        can continue with the new backend.  One-shot: returns False if
-        already activated or not configured.
+        Called when the current provider is failing after retries.  Walks
+        _fallback_chain_index forward and activates the next provider.
+        Returns False when the chain is exhausted (no more providers to try).
 
-        Uses the centralized provider router (resolve_provider_client) for
-        auth resolution and client construction — no duplicated provider→key
-        mappings.
+        Legacy compat: sets _fallback_activated = True on first activation
+        so old call-sites that check the bool still work.
         """
-        if self._fallback_activated or not self._fallback_model:
+        if not self._fallback_chain:
             return False
 
-        fb = self._fallback_model
+        # Walk forward through the chain until we find one that works
+        while self._fallback_chain_index < len(self._fallback_chain):
+            fb = self._fallback_chain[self._fallback_chain_index]
+            self._fallback_chain_index += 1
+
+            if self._activate_provider(fb, direction="down"):
+                return True
+
+        # Chain exhausted
+        logging.warning("Fallback chain exhausted — no more providers to try")
+        return False
+
+    def _try_recover_up(self) -> bool:
+        """Attempt to recover one level up the chain toward the primary.
+
+        Called periodically after successful responses.  Probes the provider
+        one step above the current position with a lightweight check, then
+        switches back if healthy.  Returns True if we moved up.
+        """
+        if self._fallback_chain_index <= 0:
+            # Already on primary or first fallback — try primary directly
+            if self._fallback_activated and self._primary_snapshot:
+                return self._try_restore_primary()
+            return False
+
+        # Try the provider one slot above our current position
+        target_idx = self._fallback_chain_index - 2  # -2 because index is post-increment
+        if target_idx < 0:
+            # Target is the primary
+            return self._try_restore_primary()
+
+        fb = self._fallback_chain[target_idx]
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
         if not fb_provider or not fb_model:
             return False
 
-        # Use centralized router for client construction.
-        # raw_codex=True because the main agent needs direct responses.stream()
-        # access for Codex providers.
+        # Probe: can we create a client?
         try:
-            from agent.auxiliary_client import resolve_provider_client
-            fb_client, _ = resolve_provider_client(
-                fb_provider, model=fb_model, raw_codex=True)
+            client, _ = self._resolve_fallback_client(fb)
+            if client is None:
+                return False
+        except Exception:
+            return False
+
+        # Activate the higher-priority provider
+        if self._activate_provider(fb, direction="up"):
+            self._fallback_chain_index = target_idx + 1  # Point past the one we just activated
+            return True
+        return False
+
+    def _try_restore_primary(self) -> bool:
+        """Try to switch back to the original primary provider."""
+        snap = getattr(self, "_primary_snapshot", None)
+        if not snap:
+            return False
+
+        try:
+            # For anthropic primary, probe with a lightweight client build
+            if snap["api_mode"] == "anthropic_messages":
+                from agent.anthropic_adapter import build_anthropic_client
+                test_client = build_anthropic_client(snap["anthropic_api_key"])
+                if test_client is None:
+                    return False
+            elif snap.get("client_kwargs"):
+                from openai import OpenAI as _OpenAI
+                test_client = _OpenAI(**snap["client_kwargs"])
+            else:
+                return False
+
+            # Restore primary state
+            old_model = self.model
+            self.model = snap["model"]
+            self.provider = snap["provider"]
+            self.base_url = snap["base_url"]
+            self.api_mode = snap["api_mode"]
+            self._use_prompt_caching = snap["use_prompt_caching"]
+
+            if snap["api_mode"] == "anthropic_messages":
+                from agent.anthropic_adapter import build_anthropic_client
+                self._anthropic_api_key = snap["anthropic_api_key"]
+                self._anthropic_client = build_anthropic_client(snap["anthropic_api_key"])
+                self.client = None
+                self._client_kwargs = {}
+            else:
+                self.client = test_client
+                self._client_kwargs = snap.get("client_kwargs", {})
+
+            self._fallback_activated = False
+            self._fallback_chain_index = 0
+            self._recovery_call_count = 0
+
+            print(
+                f"{self.log_prefix}✅ Recovered to primary: "
+                f"{snap['model']} via {snap['provider']}"
+            )
+            logging.info(
+                "Recovery to primary: %s → %s (%s)",
+                old_model, snap["model"], snap["provider"],
+            )
+            return True
+        except Exception as e:
+            logging.debug("Primary recovery probe failed: %s", e)
+            return False
+
+    def _activate_provider(self, fb: dict, direction: str = "down") -> bool:
+        """Activate a specific fallback provider entry.
+
+        Args:
+            fb: Dict with 'provider', 'model', and optionally 'base_url'/'api_key'.
+            direction: 'down' (cascade on failure) or 'up' (recovery).
+
+        Returns True on success.
+        """
+        fb_provider = (fb.get("provider") or "").strip().lower()
+        fb_model = (fb.get("model") or "").strip()
+        if not fb_provider or not fb_model:
+            return False
+
+        try:
+            fb_client, _ = self._resolve_fallback_client(fb)
             if fb_client is None:
                 logging.warning(
                     "Fallback to %s failed: provider not configured",
                     fb_provider)
                 return False
+
+            # Snapshot the current (primary) state on first fallback activation
+            if not self._fallback_activated and direction == "down":
+                self._primary_snapshot = {
+                    "model": self.model,
+                    "provider": self.provider,
+                    "base_url": self.base_url,
+                    "api_mode": self.api_mode,
+                    "use_prompt_caching": self._use_prompt_caching,
+                    "client_kwargs": getattr(self, "_client_kwargs", {}),
+                    "anthropic_api_key": getattr(self, "_anthropic_api_key", ""),
+                }
 
             # Determine api_mode from provider
             fb_api_mode = "chat_completions"
@@ -2671,9 +2812,9 @@ class AIAgent:
             self.base_url = fb_base_url
             self.api_mode = fb_api_mode
             self._fallback_activated = True
+            self._recovery_call_count = 0
 
             if fb_api_mode == "anthropic_messages":
-                # Build native Anthropic client instead of using OpenAI client
                 from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
                 effective_key = fb_client.api_key or resolve_anthropic_token() or ""
                 self._anthropic_api_key = effective_key
@@ -2681,7 +2822,6 @@ class AIAgent:
                 self.client = None
                 self._client_kwargs = {}
             else:
-                # Swap OpenAI client and config in-place
                 self.client = fb_client
                 self._client_kwargs = {
                     "api_key": fb_client.api_key,
@@ -2695,20 +2835,57 @@ class AIAgent:
                 or is_native_anthropic
             )
 
+            arrow = "⬇️" if direction == "down" else "⬆️"
+            label = "Falling back" if direction == "down" else "Recovering"
             print(
-                f"{self.log_prefix}🔄 Primary model failed — switching to fallback: "
-                f"{fb_model} via {fb_provider}"
+                f"{self.log_prefix}{arrow} {label}: "
+                f"{old_model} → {fb_model} via {fb_provider}"
             )
             logging.info(
-                "Fallback activated: %s → %s (%s)",
-                old_model, fb_model, fb_provider,
+                "Fallback chain %s: %s → %s (%s)",
+                direction, old_model, fb_model, fb_provider,
             )
             return True
         except Exception as e:
-            logging.error("Failed to activate fallback model: %s", e)
+            logging.error("Failed to activate %s fallback (%s): %s",
+                          direction, fb.get("provider"), e)
             return False
 
-    # ── End provider fallback ──────────────────────────────────────────────
+    def _resolve_fallback_client(self, fb: dict):
+        """Build a client for a fallback entry.
+
+        Supports both registry-based providers (via resolve_provider_client)
+        and inline custom entries with explicit base_url + api_key.
+        """
+        fb_provider = (fb.get("provider") or "").strip().lower()
+        fb_model = (fb.get("model") or "").strip()
+
+        # Inline custom endpoint (base_url + api_key in the config dict itself)
+        if fb.get("base_url"):
+            from openai import OpenAI as _OpenAI
+            api_key = fb.get("api_key") or "no-key"
+            client = _OpenAI(api_key=api_key, base_url=fb["base_url"])
+            return client, fb_model
+
+        # Use centralized provider router
+        from agent.auxiliary_client import resolve_provider_client
+        return resolve_provider_client(
+            fb_provider, model=fb_model, raw_codex=True)
+
+    def _maybe_try_recovery(self):
+        """Called after each successful API response to track recovery timing.
+
+        Every _RECOVERY_INTERVAL successful calls while on a fallback,
+        attempt to move one level back up the chain.
+        """
+        if not self._fallback_activated:
+            return
+        self._recovery_call_count = getattr(self, "_recovery_call_count", 0) + 1
+        if self._recovery_call_count >= self._RECOVERY_INTERVAL:
+            self._recovery_call_count = 0
+            self._try_recover_up()
+
+    # ── End provider fallback chain ────────────────────────────────────────
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
@@ -4134,6 +4311,8 @@ class AIAgent:
                 break
             
             api_call_count += 1
+            # After a successful API call, try to recover up the fallback chain
+            self._maybe_try_recovery()
             if not self.iteration_budget.consume():
                 if not self.quiet_mode:
                     print(f"\n⚠️  Session iteration budget exhausted ({self.iteration_budget.max_total} total across agent + subagents)")

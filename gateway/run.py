@@ -563,11 +563,11 @@ class GatewayRunner:
         return {}
 
     @staticmethod
-    def _load_fallback_model() -> dict | None:
+    def _load_fallback_model():
         """Load fallback model config from config.yaml.
 
-        Returns a dict with 'provider' and 'model' keys, or None if
-        not configured / both fields empty.
+        Returns a list of dicts (chain), a single dict (legacy), or None.
+        Supports both old single-entry and new list-of-entries formats.
         """
         try:
             import yaml as _y
@@ -575,8 +575,15 @@ class GatewayRunner:
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
-                fb = cfg.get("fallback_model", {}) or {}
-                if fb.get("provider") and fb.get("model"):
+                fb = cfg.get("fallback_model")
+                if isinstance(fb, list):
+                    chain = [
+                        entry for entry in fb
+                        if isinstance(entry, dict)
+                        and entry.get("provider") and entry.get("model")
+                    ]
+                    return chain or None
+                if isinstance(fb, dict) and fb.get("provider") and fb.get("model"):
                     return fb
         except Exception:
             pass

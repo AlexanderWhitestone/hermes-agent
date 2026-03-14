@@ -1251,9 +1251,18 @@ class HermesCLI:
         self._provider_require_params = pr.get("require_parameters", False)
         self._provider_data_collection = pr.get("data_collection")
         
-        # Fallback model config — tried when primary provider fails after retries
-        fb = CLI_CONFIG.get("fallback_model") or {}
-        self._fallback_model = fb if fb.get("provider") and fb.get("model") else None
+        # Fallback model chain — tried in order when primary provider fails.
+        # Supports both legacy single-dict and new list-of-dicts format.
+        fb_raw = CLI_CONFIG.get("fallback_model")
+        if isinstance(fb_raw, list):
+            self._fallback_model = [
+                entry for entry in fb_raw
+                if isinstance(entry, dict) and entry.get("provider") and entry.get("model")
+            ] or None
+        elif isinstance(fb_raw, dict) and fb_raw.get("provider") and fb_raw.get("model"):
+            self._fallback_model = fb_raw
+        else:
+            self._fallback_model = None
 
         # Agent will be initialized on first use
         self.agent: Optional[AIAgent] = None

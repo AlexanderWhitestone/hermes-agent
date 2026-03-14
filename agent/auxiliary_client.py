@@ -790,7 +790,7 @@ def get_vision_auxiliary_client() -> Tuple[Optional[OpenAI], Optional[str]]:
     # LLaVA, Pixtral, etc.) support vision — skipping them entirely
     # caused silent failures for local-only users.
     for try_fn in (_try_openrouter, _try_nous, _try_codex,
-                   _try_custom_endpoint):
+                   _try_custom_endpoint, _resolve_api_key_provider):
         client, model = try_fn()
         if client is not None:
             return client, model
